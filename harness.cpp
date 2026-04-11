@@ -1,5 +1,6 @@
 #include "Core/Boot/Boot.h"
 #include "Core/Host.h"
+#include "DiscIO/Blob.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -41,21 +42,62 @@ std::unique_ptr<GBAHostInterface> Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core
 
 int main(int argc, const char* argv[])
 {
-	printf("Running harness...\n");
+        if (argc < 2)
+        {
+                printf("./harness filepath\n");
+                return 1;
+        }
 
-	if (argc < 2)
+
+        std::unique_ptr<DiscIO::BlobReader> blob = DiscIO::CreateBlobReader(argv[1]);
+
+	// Check for a null blob
+        if (blob == nullptr)
 	{
-		printf("./harness filepath\n");
-		return 1;
+//		printf("Blob Creation failed\n");
+		return 0;
 	}
 
-	string path = argv[1];
+	else
+	{
+//		printf("Blob Creation passed\n");
+	}
 
-	std::vector<string> paths = {path};
-	std::optional<string> opt = "optional string";
-	auto params = BootParameters::GenerateFromFile(
-	    std::move(paths),
-	    BootSessionData(std::move(opt), DeleteSavestateAfterBoot::Yes));
 
+	// Checking the ReadSwapped for the blob.
+	// CreateDisc will only succeed if ReadSwapped(0x18) or ReadSwapped(0x1C) passes and is a certain value
+/*
+	auto opt = blob->ReadSwapped<u32>(0x18);
+	if (opt == std::nullopt)
+	{
+		printf("Read Swapped 0x18 failed\n");
+	}
+	else
+	{
+		printf("Read Swapped passed, gave %d\n", opt);
+	}
+
+	auto opt2 = blob->ReadSwapped<u32>(0x1c);
+	if (opt == std::nullopt)
+	{
+		printf("Read Swapped 0x1C failed\n");
+	}
+	else
+	{
+		printf("Read Swapped 0x1C passed, gave %d\n", opt);
+	}
+*/
+
+	auto volume = DiscIO::CreateDisc(move(blob));
+	if (!volume)
+	{
+//		printf("Create Disc failed\n");
+		return 1;
+	}
+	else
+	{
+//		printf("Create Disc passed\n");
+	}	
+	
 	return 0;
 }
