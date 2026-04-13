@@ -1,5 +1,9 @@
 #include "Core/Boot/Boot.h"
 #include "Core/Host.h"
+#include "DiscIO/Blob.h"
+#include "DiscIO/Volume.h"
+#include "DiscIO/VolumeDisc.h"
+#include "DiscIO/FileSystemGCWii.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -36,26 +40,86 @@ void Host_TitleChanged() {}
 std::unique_ptr<GBAHostInterface> Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core> core)
 { return nullptr; }
 
-
-
-
 int main(int argc, const char* argv[])
 {
-	printf("Running harness...\n");
+	if (argc < 2)  return 1;
 
-	if (argc < 2)
+	auto blob = DiscIO::CreateBlobReader(argv[1]);
+	if (!blob) { return 0; }
+
+	printf("blob is not null!");
+
+	// read only the header file of the WIA file
+	const u64 file_size = blob->GetDataSize();
+	std::vector<u8> buf(0x10000);	// enough size to cover the header
+
+	blob->Read(0, std::min((u64)buf.size(), file_size), buf.data());	// read header
+	for (u64 offset = 0; offset < file_size; offset += 0x8000)
+    	{
+        	u64 to_read = std::min((u64)0x8000, file_size - offset);
+        	blob->Read(offset, to_read, buf.data());
+    	}
+
+	printf("blob is read into the buffer!");
+
+	auto volume = DiscIO::CreateDisc(std::move(blob));
+	if (!volume)	return 0;
+
+	printf("We have created the volume object from disc");
+
+	volume->GetGameID();
+	volume->GetInternalName();
+	volume->GetGameTDBID();
+
+	const auto partitions = volume->GetPartitions();
+	printf("Number of partitions is %zu\n", partitions.size());
+
+	if (partitions.empty())
 	{
-		printf("./harness filepath\n");
-		return 1;
+		auto file_sys = volume->GetFileSystem(DiscIO::PARTITION_NONE);
+		if (file_sys)
+    		{
+
+			printf("Got filesystem!\n");
+			auto root = file_sys->FindFileInfo("/");
+			if (root)
+			{
+				for (const auto& child : *root)
+				{
+					child.GetName();
+					child.GetSize();
+				}
+			}
+		}
+
+		std::vector<u8> sector(0x8000);
+		for (u64 offset = 0; offset < 0x100000; offset += 0x8000)
+		{
+			volume->Read(offset, sector.size(), sector.data(), DiscIO::PARTITION_NONE);
+		}
 	}
 
-	string path = argv[1];
+	for (const auto& partition : partitions)
+	{
+		volume->GetPartitionType(partition);
+		auto file_sys = volume->GetFileSystem(partition);
+		if (file_sys)
+		{
+			auto root = file_sys->FindFileInfo("/");
+			if (root)
+			{
+				for (const auto& child : *root)
+				{
+					child.GetName();
+					child.GetSize();
+				}
+			}
+		}
 
-	std::vector<string> paths = {path};
-	std::optional<string> opt = "optional string";
-	auto params = BootParameters::GenerateFromFile(
-	    std::move(paths),
-	    BootSessionData(std::move(opt), DeleteSavestateAfterBoot::Yes));
+		std::vector<u8> sector(0x8000);
+        	volume->Read(0, sector.size(), sector.data(), partition);
+
+	}
 
 	return 0;
 }
