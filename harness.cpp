@@ -1,5 +1,6 @@
 #include "Core/Boot/Boot.h"
 #include "Core/Host.h"
+#include "DiscIO/Blob.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -41,21 +42,38 @@ std::unique_ptr<GBAHostInterface> Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core
 
 int main(int argc, const char* argv[])
 {
-	printf("Running harness...\n");
+        if (argc < 2)
+        {
+                printf("./harness filepath\n");
+                return 1;
+        }
 
-	if (argc < 2)
+
+        std::unique_ptr<DiscIO::BlobReader> blob = DiscIO::CreateBlobReader(argv[1]);
+
+	// Check for a null blob
+        if (blob == nullptr)
 	{
-		printf("./harness filepath\n");
+		return 0;
+	}
+
+
+
+	auto volume = DiscIO::CreateDisc(move(blob));
+	if (!volume)
+	{
 		return 1;
 	}
 
-	string path = argv[1];
 
-	std::vector<string> paths = {path};
-	std::optional<string> opt = "optional string";
-	auto params = BootParameters::GenerateFromFile(
-	    std::move(paths),
-	    BootSessionData(std::move(opt), DeleteSavestateAfterBoot::Yes));
+	auto part = volume->GetGamePartition();
+
+	u8* buffer;;
+	u64 i = 0;
+	while(volume->Read(i, 64, buffer, part))
+	{
+		i += 64;
+	}
 
 	return 0;
 }
