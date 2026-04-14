@@ -54,26 +54,66 @@ int main(int argc, const char* argv[])
 	// Check for a null blob
         if (blob == nullptr)
 	{
+//		printf("Blob Creation failed\n");
 		return 0;
 	}
 
+	else
+	{
+//		printf("Blob Creation passed\n");
+	}
 
+
+	// Checking the ReadSwapped for the blob.
+	// CreateDisc will only succeed if ReadSwapped(0x18) or ReadSwapped(0x1C) passes and is a certain value
+
+	auto opt = blob->ReadSwapped<u32>(0x18);
+	if (opt == std::nullopt)
+	{
+		printf("Read Swapped 0x18 failed\n");
+	}
+	else
+	{
+		printf("\n");
+		printf("Read Swapped 0x18 passed, gave 0x%X\n", opt.value());
+		printf("Expected value   -----------   0x5D1C9EA3\n");
+		printf("\n");
+	}
+
+	auto opt2 = blob->ReadSwapped<u32>(0x1c);
+	if (opt2 == std::nullopt)
+	{
+		printf("Read Swapped 0x1C failed\n");
+	}
+	else
+	{
+		printf("\n");
+		printf("Read Swapped 0x1C passed, gave 0x%X\n", opt2.value());
+		printf("Expected value   -----------   0xC2339F3D\n");
+		printf("\n");
+	}
 
 	auto volume = DiscIO::CreateDisc(move(blob));
 	if (!volume)
 	{
+//		printf("Create Disc failed\n");
 		return 1;
 	}
+	else
+	{
+//		printf("Create Disc passed\n");
+	}
 
-
+	// I don't believe any error checking needs to be done here.
 	auto part = volume->GetGamePartition();
 
-	u8* buffer;;
+	u8* buffer;
 	u64 i = 0;
 	while(volume->Read(i, 64, buffer, part))
 	{
 		i += 64;
 	}
+
 
 	return 0;
 }
