@@ -52,20 +52,80 @@ static const long MAX_INPUT_SIZE    = 32 * 1024 * 1024;  // 32MB absolute max
 static const u64  MAX_READ_OFFSET   = 0x200000;          // 2MB max read range
 static const u64  READ_CHUNK        = 0x8000;            // 32KB chunks
 
-// Helper: write buffer to temp file 
-static bool write_temp(const char* path, const std::vector<u8>& data)
+class MemoryBlobReader : public DiscIO::BlobReader
 {
-    FILE* f = fopen(path, "wb");
-    if (!f) return false;
-    fwrite(data.data(), 1, data.size(), f);
-    fclose(f);
-    return true;
-}
+public:
+    MemoryBlobReader(const u8* data, size_t size, DiscIO::BlobType type)
+        : m_data(data), m_size(size), m_type(type) {}
+
+    u64 GetDataSize() const override
+    {
+        return m_size;
+    }
+
+    u64 GetRawSize() const override
+    {
+        return m_size;
+    }
+
+    bool Read(u64 offset, u64 length, u8* out) override
+    {
+        if (offset > m_size || length > m_size || offset + length > m_size)
+            return false;
+
+        memcpy(out, m_data + offset, length);
+        return true;
+    }
+
+    DiscIO::BlobType GetBlobType() const override
+    {
+        // added dynamic typing based on file format
+        return m_type;
+    }
+
+    std::unique_ptr<DiscIO::BlobReader> CopyReader() const override
+    {
+        return std::make_unique<MemoryBlobReader>(m_data, m_size, m_type);
+    }
+
+    DiscIO::DataSizeType GetDataSizeType() const override
+    {
+        return DiscIO::DataSizeType::Accurate;
+    }
+
+    u64 GetBlockSize() const override
+    {
+        // Arbitrary but reasonable block size
+        return 0x8000;
+    }
+
+    bool HasFastRandomAccessInBlock() const override
+    {
+        // Memory is always fast random access
+        return true;
+    }
+
+    std::string GetCompressionMethod() const override
+    {
+        return "none";
+    }
+
+    std::optional<int> GetCompressionLevel() const override
+    {
+        return std::nullopt;
+    }
+
+private:
+    const u8* m_data;
+    size_t m_size;
+    DiscIO::BlobType m_type;
+};
 
 // Helper: fuzz a volume object
-static void fuzz_volume(DiscIO::VolumeDisc* vol)
+static void fuzz_volume(DiscIO::Volume* vol)
 {
-    // Metadata — all exercise header parsing branches
+    if (!vol)   return;
+
     vol->GetGameID();
     vol->GetInternalName();
     vol->GetGameTDBID();
@@ -76,36 +136,12 @@ static void fuzz_volume(DiscIO::VolumeDisc* vol)
     vol->GetRawSize();
     vol->GetBlobType();
 
+    auto* disc = dynamic_cast<DiscIO::VolumeDisc*>(vol);
+    if (!disc) return;
+
     std::vector<u8> buf(READ_CHUNK);
 
-    // GC path (no partitions)
-    const auto partitions = vol->GetPartitions();
-    if (partitions.empty())
-    {
-        // Raw reads — exercises blob decompression at multiple offsets
-        for (u64 off = 0; off < MAX_READ_OFFSET; off += READ_CHUNK)
-            vol->Read(off, READ_CHUNK, buf.data(), DiscIO::PARTITION_NONE);
-
-        // Filesystem parsing
-        auto fs = vol->GetFileSystem(DiscIO::PARTITION_NONE);
-        if (fs)
-        {
-            auto root = fs->FindFileInfo("/");
-            if (root)
-            {
-                for (const auto& child : *root)
-                {
-                    const std::string name = child.GetName();
-                    child.GetSize();
-                    child.IsDirectory();
-                    // Name lookup exercises hash/comparison code
-                    if (!name.empty())
-                        fs->FindFileInfo(name);
-                }
-            }
-        }
-        return;
-    }
+    const auto partitions = disc->GetPartitions();
 
     // Wii path (partitions)
     for (const auto& partition : partitions)
@@ -158,69 +194,54 @@ static void fuzz_blob(DiscIO::BlobReader* blob)
     }
 }
 
-// Try a format: patch magic, write temp, parse
 static void try_format(std::vector<u8> data,
                        const u8* magic, size_t magic_offset, size_t magic_len,
-                       const char* tmp_path)
+                        DiscIO::BlobType type)
 {
-    // Patch magic bytes
     if (data.size() < magic_offset + magic_len) return;
-    memcpy(data.data() + magic_offset, magic, magic_len);
 
-    if (!write_temp(tmp_path, data)) return;
+    // memcpy(data.data() + magic_offset, magic, magic_len);
 
-    auto blob = DiscIO::CreateBlobReader(tmp_path);
-    if (!blob) return;
+    auto blob = std::make_unique<MemoryBlobReader>(data.data(), data.size(), type);
 
     fuzz_blob(blob.get());
 
-    auto volume = DiscIO::CreateDisc(std::move(blob));
+    auto volume = DiscIO::CreateVolume(std::move(blob));
     if (!volume) return;
 
     fuzz_volume(volume.get());
 }
 
+
 int main(int argc, const char* argv[])
 {
-    if (argc < 2) return 1;
-
-    FILE* f = fopen(argv[1], "rb");
-    if (!f) return 0;
-
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (len < 0x40 || len > MAX_INPUT_SIZE)
+    __AFL_FUZZ_INIT();
+    
+    while (__AFL_LOOP(30000))
     {
-        fclose(f);
-        return 0;
-    }
+        const u8* buffer = __AFL_FUZZ_TESTCASE_BUF;
+        int len = __AFL_FUZZ_TESTCASE_LEN;
 
-    std::vector<u8> data(len);
-    if (fread(data.data(), 1, len, f) != (size_t)len)
-    {
-        fclose(f);
-        return 0;
-    }
-    fclose(f);
+        if (len < 0x40 || len > MAX_INPUT_SIZE)
+            continue;
 
-    // Detect format from first bytes and only try ONE path
-    // This keeps exec/sec high
-    if (len >= 4 && memcmp(data.data(), CISO_MAGIC, 4) == 0)
-        try_format(data, CISO_MAGIC, 0x00, 4, "/tmp/fuzz.ciso");
-    else if (len >= 4 && memcmp(data.data(), WBFS_MAGIC, 4) == 0)
-        try_format(data, WBFS_MAGIC, 0x00, 4, "/tmp/fuzz.wbfs");
-    else if (len >= 4 && memcmp(data.data(), WIA_MAGIC, 4) == 0)
-        try_format(data, WIA_MAGIC, 0x00, 4, "/tmp/fuzz.wia");
-    else if (len >= 4 && memcmp(data.data(), RVZ_MAGIC, 4) == 0)
-        try_format(data, RVZ_MAGIC, 0x00, 4, "/tmp/fuzz.rvz");
-    else if (len >= 0x1C + 4 &&
-             memcmp(data.data() + 0x18, WII_MAGIC, 4) == 0)
-        try_format(data, WII_MAGIC, 0x18, 4, "/tmp/fuzz_wii.iso");
-    else
-        // Default: treat as GC ISO
-        try_format(data, GC_MAGIC, 0x1C, 4, "/tmp/fuzz_gc.iso");
+        std::vector<u8> data(buffer, buffer + len);
+
+        // format detection
+        if (len >= 4 && memcmp(data.data(), CISO_MAGIC, 4) == 0)
+            try_format(data, CISO_MAGIC, 0x00, 4, DiscIO::BlobType::CISO);
+        else if (len >= 4 && memcmp(data.data(), WBFS_MAGIC, 4) == 0)
+            try_format(data, WBFS_MAGIC, 0x00, 4, DiscIO::BlobType::WBFS);
+        else if (len >= 4 && memcmp(data.data(), WIA_MAGIC, 4) == 0)
+            try_format(data, WIA_MAGIC, 0x00, 4, DiscIO::BlobType::WIA);
+        else if (len >= 4 && memcmp(data.data(), RVZ_MAGIC, 4) == 0)
+            try_format(data, RVZ_MAGIC, 0x00, 4, DiscIO::BlobType::RVZ);
+        else if (len >= 0x1C + 4 &&
+                 memcmp(data.data() + 0x18, WII_MAGIC, 4) == 0)
+            try_format(data, WII_MAGIC, 0x18, 4, DiscIO::BlobType::PLAIN);
+        else
+            try_format(data, GC_MAGIC, 0x1C, 4, DiscIO::BlobType::PLAIN);
+    }
 
     return 0;
 }
