@@ -1,371 +1,247 @@
-// AFL++ Fuzzing Harness for DiscIO::CreateVolume
-// Target: dolphin-emu/dolphin
-//
-// Build instructions:
-//
-//   1. Clone and configure Dolphin with fuzzing flags:
-//
-//      git clone --recurse-submodules https://github.com/dolphin-emu/dolphin.git
-//      cd dolphin
-//      mkdir build-fuzz && cd build-fuzz
-//
-//      CC=afl-clang-fast CXX=afl-clang-fast++ cmake .. \
-//        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-//        -DENABLE_LTO=OFF \
-//        -DENABLE_TESTS=OFF \
-//        -DENABLE_QT=OFF \
-//        -DENABLE_NOGUI=OFF \
-//        -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-//        -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-//        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-//
-//      make -j$(nproc) dolphin-emu-nogui core discio common
-//
-//   2. Compile this harness (from the repo root):
-//
-//      afl-clang-fast++ -std=c++20 \
-//        -fsanitize=address,undefined \
-//        -fno-omit-frame-pointer \
-//        -I Source/Core \
-//        -I Externals/fmt/include \
-//        -I Externals/mbedtls/include \
-//        fuzz_create_volume.cpp \
-//        -o fuzz_create_volume \
-//        -L build-fuzz/Source/Core/DiscIO \
-//        -L build-fuzz/Source/Core/Common \
-//        -ldiscio -lcommon \
-//        -Wl,-rpath,build-fuzz/Source/Core/DiscIO \
-//        -Wl,-rpath,build-fuzz/Source/Core/Common
-//
-//   3. Create seed corpus (representative disc/WAD headers):
-//
-//      mkdir -p corpus/
-//      # Seed 1: Minimal GameCube disc header (magic at 0x1C = 0xC2339F3D)
-//      python3 -c "
-//        import struct
-//        buf = bytearray(0x450)
-//        # Game ID (6 bytes) + padding (2) + disc number + game version + streaming
-//        buf[0:6] = b'GALE01'
-//        buf[0x1C:0x20] = struct.pack('>I', 0xC2339F3D)  # GC magic
-//        buf[0x20:0x24] = struct.pack('>I', 0x0D96E06B)  # Wii magic (absent)
-//        open('corpus/gc_header.bin', 'wb').write(buf)
-//      "
-//      # Seed 2: Minimal Wii disc header
-//      python3 -c "
-//        import struct
-//        buf = bytearray(0x50000)
-//        buf[0:6] = b'RSBE01'
-//        buf[0x18:0x1C] = struct.pack('>I', 0x5D1C9EA3)  # Wii magic
-//        open('corpus/wii_header.bin', 'wb').write(buf)
-//      "
-//      # Seed 3: Minimal WAD header (type 0x4973 = 'Is', little-endian header size 0x20)
-//      python3 -c "
-//        import struct
-//        buf = bytearray(0x200)
-//        buf[0:4] = struct.pack('>I', 0x20)        # header size
-//        buf[4:6] = b'Is'                          # WAD type
-//        open('corpus/wad_header.bin', 'wb').write(buf)
-//      "
-//
-//   4. Run the fuzzer:
-//
-//      AFL_SKIP_CPUFREQ=1 afl-fuzz \
-//        -i corpus/ \
-//        -o findings/ \
-//        -m none \
-//        -- ./fuzz_create_volume @@
-//
-//      Or use stdin mode (harness supports both):
-//
-//      AFL_SKIP_CPUFREQ=1 afl-fuzz \
-//        -i corpus/ \
-//        -o findings/ \
-//        -m none \
-//        -- ./fuzz_create_volume
-//
-// Notes:
-//   - ASAN + UBSAN are strongly recommended (-fsanitize=address,undefined).
-//   - For faster throughput, consider persistent mode (see bottom of this file).
-//   - The harness exercises: magic-byte detection, BlobReader dispatch, partition
-//     table parsing (Wii), file system construction (GC/Wii), WAD ticket/TMD
-//     parsing, and all metadata accessors on the returned Volume.
-// ---------------------------------------------------------------------------
-
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <optional>
-#include <string>
-#include <vector>
-
-// Dolphin headers — adjust include paths to match your build layout.
-#include "Common/CommonTypes.h"
+#include "Core/Host.h"
 #include "DiscIO/Blob.h"
 #include "DiscIO/Volume.h"
-#include "DiscIO/Filesystem.h"
+#include "DiscIO/VolumeDisc.h"
+#include "DiscIO/FileSystemGCWii.h"
 
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+#include <algorithm>
 
+using std::string;
 
+// --- Stub Host callbacks ---
+std::vector<std::string> Host_GetPreferredLocales() { return {}; }
+void Host_PPCSymbolsChanged() {}
+void Host_PPCBreakpointsChanged() {}
+void Host_Message(HostMessageID) {}
+void Host_UpdateTitle(const string&) {}
+void Host_UpdateDiscordClientID(const string&) {}
+bool Host_UpdateDiscordPresenceRaw(const string&, const string&,
+                                   const string&, const string&,
+                                   const string&, const string&,
+                                   const int64_t, const int64_t,
+                                   const int, const int) { return false; }
+void Host_UpdateDisasmDialog() {}
+void Host_JitCacheInvalidation() {}
+void Host_JitProfileDataWiped() {}
+void Host_RequestRenderWindowSize(int, int) {}
+bool Host_UIBlocksControllerState() { return false; }
+bool Host_RendererHasFocus() { return false; }
+bool Host_RendererHasFullFocus() { return false; }
+bool Host_RendererIsFullscreen() { return false; }
+bool Host_TASInputHasFocus() { return false; }
+void Host_YieldToUI() {}
+void Host_TitleChanged() {}
+std::unique_ptr<GBAHostInterface> Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core> core)
+{ return nullptr; }
 
-// ---------------------------------------------------------------------------
-// MemoryBlobReader — a BlobReader backed by an in-memory byte buffer.
-// This avoids touching the filesystem and keeps the harness self-contained.
-// ---------------------------------------------------------------------------
-namespace
-{
+// Magic byte constants
+static const u8 GC_MAGIC[4]   = {0xC2, 0x33, 0x9F, 0x3D};  // @ 0x1C
+static const u8 WII_MAGIC[4]  = {0x5D, 0x1C, 0x9E, 0xA3};  // @ 0x18
+static const u8 WIA_MAGIC[4]  = {'W',  'I',  'A',  0x01};  // @ 0x00
+static const u8 RVZ_MAGIC[4]  = {'R',  'V',  'Z',  0x01};  // @ 0x00
+static const u8 CISO_MAGIC[4] = {'C',  'I',  'S',  'O'};   // @ 0x00
+static const u8 WBFS_MAGIC[4] = {'W',  'B',  'F',  'S'};   // @ 0x00
 
-class MemoryBlobReader final : public DiscIO::BlobReader
+// Size limits
+static const long MAX_INPUT_SIZE    = 32 * 1024 * 1024;  // 32MB absolute max
+static const u64  MAX_READ_OFFSET   = 0x200000;          // 2MB max read range
+static const u64  READ_CHUNK        = 0x8000;            // 32KB chunks
+
+class MemoryBlobReader : public DiscIO::BlobReader
 {
 public:
-  explicit MemoryBlobReader(const uint8_t* data, size_t size)
-      : m_data(data, data + size), m_size(static_cast<u64>(size))
-  {
-  }
+    MemoryBlobReader(const u8* data, size_t size, DiscIO::BlobType type)
+        : m_data(data), m_size(size), m_type(type) {}
 
-	// Plain Blobs are considered ISO files.
-	// Override GetBlobType()
-  DiscIO::BlobType GetBlobType() const override { return DiscIO::BlobType::PLAIN; }
-
-
-	// Override CopyReader()
-  std::unique_ptr<DiscIO::BlobReader> CopyReader() const override
-  {
-    return std::make_unique<MemoryBlobReader>(m_data.data(), m_data.size());
-  }
-
-
-	// Override GetDataSize()
-  // Total logical size of the disc image (what the Volume layer sees).
-  u64 GetDataSize() const override { return m_size; }
-
-	// Override GetDataSizeType()
-  DiscIO::DataSizeType GetDataSizeType() const override
-  {
-    return DiscIO::DataSizeType::Accurate;
-  }
-
-	// Override GetRawSize()
-  // Raw size == logical size for plain blobs.
-  u64 GetRawSize() const override { return m_size; }
-
-
-	// Override GetBlockSize()
-  // Block size: report as 1 (no compression).
-  u64 GetBlockSize() const override { return 0; }
-
-	// Override HasFastRandomAccessInBlock()
-  bool HasFastRandomAccessInBlock() const override { return true; }
-
-
-
-	// Genuinely no idea what Claude was trying to do here. AllowCaching() doesn't exist in the parent
-	// class; it fully hallucinated that. I'm wondering if it's maybe supposed to be IsCached()? That
-	// exists in the parent, but I'm not sure if it's what we want. We'll try it and see.
-//  bool AllowCaching() const override { return true; }
-	bool IsCached() const override { return true; }
-
-	// This also got hallucinated? BlobReader does have a GetName(), but it's not a virtual method.
-  // std::string GetName() const override { return "fuzz_memory_blob"; }
-	std::string GetName() const { return "fuzz_memory_blob"; }
-
-
-
-	// Override Read()
-  bool Read(u64 offset, u64 length, uint8_t* out_ptr) override
-  {
-    if (offset >= m_size || length > m_size - offset)
+    u64 GetDataSize() const override
     {
-      // Reads past the end: zero-fill so the Volume layer can keep going.
-      const u64 available = (offset < m_size) ? (m_size - offset) : 0;
-      if (available > 0)
-        std::memcpy(out_ptr, m_data.data() + offset, static_cast<size_t>(available));
-      if (length > available)
-        std::memset(out_ptr + available, 0, static_cast<size_t>(length - available));
-      return false;
+        return m_size;
     }
-    std::memcpy(out_ptr, m_data.data() + offset, static_cast<size_t>(length));
-    return true;
-  }
 
+    u64 GetRawSize() const override
+    {
+        return m_size;
+    }
 
-	// Okay, for some reason, there's a bunch of functions that Claude did not feel
-	// the need to override. That's probably why MemoryBlobReader is considered an
-	// abstract class.
-	// I'm gonna try to fix those, based off other BlobReader implementations in
-	// the Dolphin repo.
-  // Right, these are working, but they might be jank. Keep an eye on them.
-	~MemoryBlobReader() override;
-	std::string GetCompressionMethod() const override;
-	std::optional<int> GetCompressionLevel() const override { return std::nullopt; }
-	bool SupportsReadWiiDecrypted(u64 offset, u64 size, u64 partition_data_offset) const override;
-	bool ReadWiiDecrypted(u64 offset, u64 size, u8* out_ptr, u64 partition_data_offset) override;
+    bool Read(u64 offset, u64 length, u8* out) override
+    {
+        if (offset > m_size || length > m_size || offset + length > m_size)
+            return false;
+
+        memcpy(out, m_data + offset, length);
+        return true;
+    }
+
+    DiscIO::BlobType GetBlobType() const override
+    {
+        // added dynamic typing based on file format
+        return m_type;
+    }
+
+    std::unique_ptr<DiscIO::BlobReader> CopyReader() const override
+    {
+        return std::make_unique<MemoryBlobReader>(m_data, m_size, m_type);
+    }
+
+    DiscIO::DataSizeType GetDataSizeType() const override
+    {
+        return DiscIO::DataSizeType::Accurate;
+    }
+
+    u64 GetBlockSize() const override
+    {
+        // Arbitrary but reasonable block size
+        return 0x8000;
+    }
+
+    bool HasFastRandomAccessInBlock() const override
+    {
+        // Memory is always fast random access
+        return true;
+    }
+
+    std::string GetCompressionMethod() const override
+    {
+        return "none";
+    }
+
+    std::optional<int> GetCompressionLevel() const override
+    {
+        return std::nullopt;
+    }
 
 private:
-  std::vector<uint8_t> m_data;
-  u64 m_size;
+    const u8* m_data;
+    size_t m_size;
+    DiscIO::BlobType m_type;
 };
 
-
-
-
-
-// ---------------------------------------------------------------------------
-// exercise_volume — call common accessors to maximise code coverage.
-// We deliberately ignore return values: we are hunting crashes/hangs, not
-// testing correctness.
-// ---------------------------------------------------------------------------
-void exercise_volume(DiscIO::Volume& vol)
+// Helper: fuzz a volume object
+static void fuzz_volume(DiscIO::Volume* vol)
 {
-  const DiscIO::Partition part = DiscIO::PARTITION_NONE;
+    if (!vol)   return;
 
-  // Basic metadata
-  (void)vol.GetGameID();
-  (void)vol.GetGameID(part);
-  (void)vol.GetSyncHash();
-  (void)vol.GetVolumeType();
-  (void)vol.GetDataSize();
-  (void)vol.GetRawSize();
+    vol->GetGameID();
+    vol->GetInternalName();
+    vol->GetGameTDBID();
+    vol->GetRevision();
+    vol->GetDiscNumber();
+    vol->GetVolumeType();
+    vol->GetDataSize();
+    vol->GetRawSize();
+    vol->GetBlobType();
 
-  // Partition enumeration (Wii discs)
-  const auto partitions = vol.GetPartitions();
-  for (const auto& p : partitions)
-  {
-    (void)vol.GetPartitionType(p);
-    (void)vol.GetTitleID(p);
-    (void)vol.GetGameID(p);
+    auto* disc = dynamic_cast<DiscIO::VolumeDisc*>(vol);
+    if (!disc) return;
 
-    // Read small chunks from each partition
-    std::vector<uint8_t> buf(0x440);
-    (void)vol.Read(0, buf.size(), buf.data(), p);
-  }
+    std::vector<u8> buf(READ_CHUNK);
 
-  // File system access
-  const DiscIO::FileSystem* fs = vol.GetFileSystem(part);
-  if (fs && fs->IsValid())
-  {
-    const DiscIO::FileInfo& root = fs->GetRoot();
-    // Iterate top-level entries (limit to avoid infinite loops on corrupt data)
-    int count = 0;
-    for (auto it = root.cbegin(); it != root.cend() && count < 64; ++it, ++count)
+    const auto partitions = disc->GetPartitions();
+
+    // Wii path (partitions)
+    for (const auto& partition : partitions)
     {
-      (void)it->GetName();
-      (void)it->GetSize();
-      (void)it->IsDirectory();
+        vol->GetPartitionType(partition);
+        vol->GetTitleID(partition);
+        vol->GetTicket(partition);
+        vol->GetTMD(partition);
+
+        // Encrypted reads — exercises AES + decompression
+        for (u64 off = 0; off < MAX_READ_OFFSET; off += READ_CHUNK)
+            vol->Read(off, READ_CHUNK, buf.data(), partition);
+
+        auto fs = vol->GetFileSystem(partition);
+        if (fs)
+        {
+            auto root = fs->FindFileInfo("/");
+            if (root)
+            {
+                for (const auto& child : *root)
+                {
+                    const std::string name = child.GetName();
+                    child.GetSize();
+                    child.IsDirectory();
+                    if (!name.empty())
+                        fs->FindFileInfo(name);
+                }
+            }
+        }
     }
-  }
-
-  // WAD-specific accessors (no-op on disc volumes)
-  (void)vol.GetTicket(part);
-  (void)vol.GetTMD(part);
-  (void)vol.GetCertificateChain(part);
-
-  // Read small regions of the raw blob
-  {
-    constexpr size_t kReadSize = 0x100;
-    std::vector<uint8_t> buf(kReadSize);
-    for (u64 offset : {u64(0), u64(0x400), u64(0x40000), u64(0x50000)})
-      (void)vol.Read(offset, kReadSize, buf.data(), part);
-  }
-
-  // Country / region / language
-  (void)vol.GetCountry(part);
-  (void)vol.GetRegion();
 }
 
-// ---------------------------------------------------------------------------
-// fuzz_one — core fuzzing entry point called with raw mutated bytes.
-// ---------------------------------------------------------------------------
-void fuzz_one(const uint8_t* data, size_t size)
+// Helper: fuzz blob-level reading 
+static void fuzz_blob(DiscIO::BlobReader* blob)
 {
-  // AFL++ may feed us empty or tiny inputs; guard against them.
-  if (size == 0)
-    return;
+    const u64 data_size = blob->GetDataSize();
+    const u64 raw_size  = blob->GetRawSize();
 
-  auto reader = std::make_unique<MemoryBlobReader>(data, size);
+    // Sanity check — skip if sizes look corrupted/huge
+    if (data_size > (u64)MAX_INPUT_SIZE * 4) return;
+    if (raw_size  > (u64)MAX_INPUT_SIZE * 4) return;
 
-  // CreateVolume inspects magic bytes to choose between VolumeGC, VolumeWii,
-  // and VolumeWAD.  A nullptr return means the input was not recognised — that
-  // is expected and not a bug.
-  std::unique_ptr<DiscIO::Volume> vol = DiscIO::CreateVolume(std::move(reader));
-  if (!vol)
-    return;
+    std::vector<u8> buf(READ_CHUNK);
+    const u64 limit = std::min(data_size, MAX_READ_OFFSET);
 
-  // Drive as much of the Volume implementation as possible.
-  exercise_volume(*vol);
-}
-
-// ---------------------------------------------------------------------------
-// Read all bytes from a FILE* into a vector.
-// ---------------------------------------------------------------------------
-std::vector<uint8_t> read_file(FILE* f)
-{
-  std::vector<uint8_t> buf;
-  uint8_t chunk[4096];
-  size_t n;
-  while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0)
-    buf.insert(buf.end(), chunk, chunk + n);
-  return buf;
-}
-
-}  // anonymous namespace
-
-// ---------------------------------------------------------------------------
-// main — supports two modes:
-//   1. File mode:  ./fuzz_create_volume <path>   (used with afl-fuzz @@ )
-//   2. Stdin mode: ./fuzz_create_volume           (used with afl-fuzz  )
-//
-// AFL++ persistent-mode macro is used when available to avoid process
-// re-spawning overhead; fall back to single-shot execution otherwise.
-// ---------------------------------------------------------------------------
-
-#ifdef __AFL_FUZZ_TESTCASE_BUF
-// -------------------------------------------------------------------------
-// AFL++ persistent mode — fastest throughput.
-// Requires compiling with afl-clang-fast / afl-clang-lto.
-// -------------------------------------------------------------------------
-__AFL_FUZZ_INIT();
-
-int main()
-{
-  __AFL_INIT();
-  const uint8_t* buf = __AFL_FUZZ_TESTCASE_BUF;
-  while (__AFL_LOOP(10000))
-  {
-    const size_t len = __AFL_FUZZ_TESTCASE_LEN;
-    fuzz_one(buf, len);
-  }
-  return 0;
-}
-
-#else
-// -------------------------------------------------------------------------
-// Non-persistent / file-based mode.
-// -------------------------------------------------------------------------
-int main(int argc, char* argv[])
-{
-  std::vector<uint8_t> data;
-
-  if (argc >= 2)
-  {
-    // File path supplied (afl-fuzz @@ style).
-    FILE* f = std::fopen(argv[1], "rb");
-    if (!f)
+    for (u64 off = 0; off < limit; off += READ_CHUNK)
     {
-      std::perror("fopen");
-      return 1;
+        u64 to_read = std::min(READ_CHUNK, limit - off);
+        blob->Read(off, to_read, buf.data());
     }
-    data = read_file(f);
-    std::fclose(f);
-  }
-  else
-  {
-    // Read from stdin (afl-fuzz pipe style).
-    data = read_file(stdin);
-  }
-
-  fuzz_one(data.data(), data.size());
-  return 0;
 }
-#endif  // __AFL_FUZZ_TESTCASE_BUF
+
+static void try_format(std::vector<u8> data,
+                       const u8* magic, size_t magic_offset, size_t magic_len,
+                        DiscIO::BlobType type)
+{
+    if (data.size() < magic_offset + magic_len) return;
+
+    // memcpy(data.data() + magic_offset, magic, magic_len);
+
+    auto blob = std::make_unique<MemoryBlobReader>(data.data(), data.size(), type);
+
+    fuzz_blob(blob.get());
+
+    auto volume = DiscIO::CreateVolume(std::move(blob));
+    if (!volume) return;
+
+    fuzz_volume(volume.get());
+}
+
+
+int main(int argc, const char* argv[])
+{
+    __AFL_FUZZ_INIT();
+    
+    while (__AFL_LOOP(30000))
+    {
+        const u8* buffer = __AFL_FUZZ_TESTCASE_BUF;
+        int len = __AFL_FUZZ_TESTCASE_LEN;
+
+        if (len < 0x40 || len > MAX_INPUT_SIZE)
+            continue;
+
+        std::vector<u8> data(buffer, buffer + len);
+
+        // format detection
+        if (len >= 4 && memcmp(data.data(), CISO_MAGIC, 4) == 0)
+            try_format(data, CISO_MAGIC, 0x00, 4, DiscIO::BlobType::CISO);
+        else if (len >= 4 && memcmp(data.data(), WBFS_MAGIC, 4) == 0)
+            try_format(data, WBFS_MAGIC, 0x00, 4, DiscIO::BlobType::WBFS);
+        else if (len >= 4 && memcmp(data.data(), WIA_MAGIC, 4) == 0)
+            try_format(data, WIA_MAGIC, 0x00, 4, DiscIO::BlobType::WIA);
+        else if (len >= 4 && memcmp(data.data(), RVZ_MAGIC, 4) == 0)
+            try_format(data, RVZ_MAGIC, 0x00, 4, DiscIO::BlobType::RVZ);
+        else if (len >= 0x1C + 4 &&
+                 memcmp(data.data() + 0x18, WII_MAGIC, 4) == 0)
+            try_format(data, WII_MAGIC, 0x18, 4, DiscIO::BlobType::PLAIN);
+        else
+            try_format(data, GC_MAGIC, 0x1C, 4, DiscIO::BlobType::PLAIN);
+    }
+
+    return 0;
+}
